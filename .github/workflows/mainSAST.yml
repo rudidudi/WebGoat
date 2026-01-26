@@ -1,0 +1,137 @@
+name: cortex Cloud IaC Scaning
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+env:
+  CORTEX_API_KEY: ${{secrets.CORTEX_API_KEY}}
+  CORTEX_API_KEY_ID: ${{secrets.CORTEX_API_KEY_ID}}
+  CORTEX_API_URL: https://api-eagles-cxsiamp.xdr.eu.paloaltonetworks.com
+  PRISMA_API_URL: https://api0.prismacloud.io/
+  PRISMA_CLOUD_CONSOLE: https://app0.cloud.twistlock.com/app0-93081927
+  REPO_ID: JavaSpringWebApp/Main/github
+  BUILD_IMAGE: "danieltor/java-spring-boot"
+
+jobs:
+  # -----------------------------------------------------------------
+  # JOB 1: Semgrep SAST Scan (Running in parallel)
+  # -----------------------------------------------------------------
+  semgrep-scan:
+    name: semgrep/ci
+    runs-on: ubuntu-latest
+    
+    # This prevents the job from running on dependabot PRs to save credits
+    if: (github.actor != 'dependabot[bot]')
+    
+    # Use the official Docker container as requested
+    container:
+      image: semgrep/semgrep
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep CI
+        run: semgrep ci
+        env:
+           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        # SOFT FAIL: This ensures the pipeline continues even if issues are found
+        continue-on-error: true
+
+  # -----------------------------------------------------------------
+  # JOB 2: Cortex Scan & Build (Existing Logic)
+  # -----------------------------------------------------------------
+  cortex-code-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Verify Node.js Version
+      run: node -v
+
+    - name: Install libhyperscan5
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libhyperscan5
+
+    - name: Download cortexcli
+      run: |
+        set -x
+        crtx_resp=$(curl "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
+          -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
+          -H "Authorization: ${CORTEX_API_KEY}")
+        crtx_url=$(echo $crtx_resp | jq -r ".signed_url")
+        curl -o cortexcli $crtx_url
+        chmod +x cortexcli
+        ./cortexcli --version
+
+    - name: Run Cortex CLI Code Scan
+      run: |
+        ./cortexcli \
+          --api-base-url "${CORTEX_API_URL}" \
+          --api-key "${CORTEX_API_KEY}" \
+          --api-key-id "${CORTEX_API_KEY_ID}" \
+          --soft-fail \
+          code scan \
+          --directory "${{github.workspace}}" \
+          --repo-id "${{github.repository}}" \
+          --branch "${{github.ref_name}}" \
+          --source "GITHUB_ACTIONS" \
+          --create-repo-if-missing \
+          --timeout 300
+
+    - name: Set up JDK
+      uses: actions/setup-java@v1
+      with:
+          java-version: '11'
+
+    - name: Cache Maven packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+    
+    - name: Build with Maven
+      run: mvn -B package -DskipTests --file pom.xml
+
+    - name: Build the Docker image
+      run: docker build . --tag ${{ env.BUILD_IMAGE }}:latest  
+
+    - name: Run Cortex Image Scan
+      run: |
+        ./cortexcli \
+          --api-base-url "${CORTEX_API_URL}" \
+          --api-key "${CORTEX_API_KEY}" \
+          --api-key-id "${CORTEX_API_KEY_ID}" \
+          image scan \
+          --timeout 300 \
+          ${{ env.BUILD_IMAGE }}:latest
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v1
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Push container to registry
+      run: docker push ${{ env.BUILD_IMAGE }}:latest
+
+  # -----------------------------------------------------------------
+  # JOB 3: Deploy
+  # -----------------------------------------------------------------
+  deploy-without-cortex-cloud:      
+    # Now depends on BOTH scan jobs finishing
+    needs: [cortex-code-scan, semgrep-scan]
+    name: Deploy application to Kubernetes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy the container
+        run: echo "Shift Happens"
